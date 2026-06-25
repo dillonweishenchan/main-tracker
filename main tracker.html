@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Fund Tracker</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
   :root{
     --navy:#0f2942; --navy-2:#16395c; --ink:#1f2937; --muted:#6b7280;
@@ -44,6 +45,11 @@
   .topbar-actions{display:flex;gap:8px}
   .topbar-actions button{background:rgba(255,255,255,.12);color:#fff}
   .topbar-actions button:hover{background:rgba(255,255,255,.22)}
+  .sync{font-size:12px;font-weight:600;padding:3px 10px;border-radius:20px;white-space:nowrap;align-self:center}
+  .sync.ok{background:rgba(16,185,129,.22);color:#a7f3d0}
+  .sync.muted{background:rgba(255,255,255,.14);color:rgba(255,255,255,.85)}
+  .sync.err{background:rgba(239,68,68,.25);color:#fecaca}
+  .uemail{align-self:center;color:rgba(255,255,255,.7);font-size:12px;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
   .wrap{max-width:1240px;margin:0 auto;padding:24px 28px 60px}
   .section-head{display:flex;align-items:center;justify-content:space-between;margin:30px 0 14px}
@@ -145,10 +151,13 @@
       </div>
     </div>
     <div class="topbar-actions">
+      <span id="syncStatus" class="sync hide-sm" style="display:none"></span>
+      <span id="userEmail" class="uemail hide-sm" style="display:none"></span>
       <button onclick="addTxn()">+ Transaction</button>
       <button onclick="addInvestor()" class="hide-sm">+ Investor</button>
       <button onclick="exportData()" class="hide-sm" title="Download a backup">Export</button>
       <button onclick="document.getElementById('importFile').click()" class="hide-sm" title="Load a backup">Import</button>
+      <button id="signOutBtn" onclick="signOut()" style="display:none" title="Sign out">Sign out</button>
       <button onclick="resetMenu()" title="Sample data / clear">⋯</button>
       <input type="file" id="importFile" accept="application/json" style="display:none" onchange="importData(event)">
     </div>
@@ -220,6 +229,23 @@
   </p>
 </div>
 
+<!-- SIGN-IN OVERLAY -->
+<div class="overlay" id="authOverlay">
+  <div class="modal" style="max-width:380px">
+    <div class="modal-head">Sign in to your fund</div>
+    <div class="modal-body">
+      <div class="field"><label>Email</label><input id="authEmail" type="email" autocomplete="username" placeholder="you@example.com"></div>
+      <div class="field"><label>Password</label><input id="authPass" type="password" autocomplete="current-password" placeholder="At least 6 characters"></div>
+      <div id="authMsg" style="font-size:12.5px;color:var(--muted);min-height:17px"></div>
+      <div class="hint">First time here? Enter an email and password, then choose <b>Create account</b>. After that, sign in with the same details on any device — your fund data follows you everywhere.</div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn-light" onclick="doAuth('signup')">Create account</button>
+      <button class="btn-primary" onclick="doAuth('signin')">Sign in</button>
+    </div>
+  </div>
+</div>
+
 <!-- INVESTOR MODAL -->
 <div class="overlay" id="invModal">
   <div class="modal">
@@ -279,6 +305,16 @@ const PALETTE=['#0ea5e9','#6366f1','#059669','#f59e0b','#ef4444','#8b5cf6','#14b
 const KEY='fundTracker.v1';
 let state=null, sortKey='ownership', sortDir=-1, ledgerDir=-1, editInvId=null, editTxnId=null;
 
+/* ============================================================
+   SUPABASE CLOUD SYNC  —  paste your two values between the quotes.
+   Find them in Supabase  ->  Project Settings  ->  API.
+   Until BOTH are filled in, the app simply saves to this browser only.
+   ============================================================ */
+const SUPABASE_URL = 'https://mfesnowwhchmfvtmhzpj.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1mZXNub3d3aGNobWZ2dG1oenBqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIzNzAwMzgsImV4cCI6MjA5Nzk0NjAzOH0.24JVuiZK8gA_w9_jw1wcDnjNxTK8rpYK6yMj6CAjgd0';
+const CLOUD = /^https:\/\/.+\.supabase\.co\/?$/.test(SUPABASE_URL) && SUPABASE_ANON_KEY.length > 30;
+let sb=null, user=null, saveTimer=null, lastSyncedJSON='';
+
 /* ---------- sample data ---------- */
 function sampleData(){
   const I=(id,name)=>({id,name});
@@ -299,10 +335,81 @@ function sampleData(){
   };
 }
 /* ---------- persistence ---------- */
-function save(){localStorage.setItem(KEY,JSON.stringify(state));}
+function save(){
+  try{localStorage.setItem(KEY,JSON.stringify(state));}catch(e){}
+  if(CLOUD && user) cloudSave();
+}
 function load(){
   try{const r=localStorage.getItem(KEY);if(r){state=JSON.parse(r);return;}}catch(e){}
   state=sampleData();
+}
+
+/* ---------- cloud sync (Supabase) ---------- */
+function setStatus(t,c){const el=document.getElementById('syncStatus');if(!el)return;el.style.display='inline-block';el.textContent=t;el.className='sync hide-sm '+(c||'');}
+async function cloudInit(){
+  if(!CLOUD)return;
+  if(typeof supabase==='undefined'){setStatus('Offline','err');return;}
+  sb=supabase.createClient(SUPABASE_URL,SUPABASE_ANON_KEY);
+  let session=null;
+  try{const r=await sb.auth.getSession();session=r.data.session;}catch(e){}
+  if(session && session.user){user=session.user;await afterLogin();}
+  else{showLogin();}
+}
+function showLogin(){const m=document.getElementById('authMsg');if(m)m.textContent='';openModal('authOverlay');setTimeout(()=>{const el=document.getElementById('authEmail');if(el)el.focus();},60);}
+function hideLogin(){closeModal('authOverlay');}
+async function doAuth(mode){
+  const email=document.getElementById('authEmail').value.trim();
+  const pass=document.getElementById('authPass').value;
+  const msg=document.getElementById('authMsg');
+  if(!email||!pass){msg.style.color='var(--red)';msg.textContent='Enter your email and password.';return;}
+  msg.style.color='var(--muted)';msg.textContent='Working…';
+  let res;
+  try{
+    res = mode==='signup'
+      ? await sb.auth.signUp({email,password:pass})
+      : await sb.auth.signInWithPassword({email,password:pass});
+  }catch(e){msg.style.color='var(--red)';msg.textContent='Network error — please try again.';return;}
+  if(res.error){msg.style.color='var(--red)';msg.textContent=res.error.message;return;}
+  if(mode==='signup' && !(res.data && res.data.session)){msg.style.color='var(--ink)';msg.textContent='Account created. Check your email to confirm, then Sign in.';return;}
+  user=res.data.user;
+  await afterLogin();
+}
+async function signOut(){try{await sb.auth.signOut();}catch(e){}user=null;location.reload();}
+async function afterLogin(){
+  hideLogin();
+  document.getElementById('signOutBtn').style.display='inline-block';
+  const ue=document.getElementById('userEmail');ue.textContent=user.email;ue.style.display='inline-block';
+  setStatus('Loading…','muted');
+  let row=null,err=null;
+  try{const r=await sb.from('funds').select('data').eq('user_id',user.id).maybeSingle();row=r.data;err=r.error;}
+  catch(e){err=e;}
+  if(err){setStatus('Sync error','err');console.error(err);return;}
+  if(row && row.data){state=row.data;lastSyncedJSON=JSON.stringify(state);render();setStatus('Synced','ok');}
+  else{lastSyncedJSON='';render();await cloudSaveNow();}   // first sign-in: seed the cloud with current data
+}
+function cloudSave(){
+  if(JSON.stringify(state)===lastSyncedJSON)return;
+  setStatus('Saving…','muted');
+  clearTimeout(saveTimer);saveTimer=setTimeout(cloudSaveNow,700);
+}
+async function cloudSaveNow(){
+  if(!CLOUD||!user)return;
+  clearTimeout(saveTimer);
+  const json=JSON.stringify(state);
+  if(json===lastSyncedJSON){setStatus('Synced','ok');return;}
+  const {error}=await sb.from('funds').upsert({user_id:user.id,data:state,updated_at:new Date().toISOString()});
+  if(error){setStatus('Save failed','err');console.error(error);return;}
+  lastSyncedJSON=json;setStatus('Synced','ok');
+}
+async function cloudRefresh(){
+  if(!CLOUD||!user)return;
+  try{
+    const {data}=await sb.from('funds').select('data').eq('user_id',user.id).maybeSingle();
+    if(data && data.data){
+      const json=JSON.stringify(data.data);
+      if(json!==JSON.stringify(state)){state=data.data;lastSyncedJSON=json;render();setStatus('Synced','ok');}
+    }
+  }catch(e){}
 }
 /* ---------- helpers ---------- */
 const uid=p=>p+Math.random().toString(36).slice(2,9);
@@ -580,12 +687,15 @@ document.querySelectorAll('th[data-sort]').forEach(th=>th.addEventListener('clic
   const k=th.dataset.sort;if(sortKey===k)sortDir*=-1;else{sortKey=k;sortDir=(k==='name')?1:-1;}render();
 }));
 document.querySelectorAll('th[data-sortl]').forEach(th=>th.addEventListener('click',()=>{ledgerDir*=-1;renderLedger();}));
-document.querySelectorAll('.overlay').forEach(o=>o.addEventListener('click',e=>{if(e.target===o)o.classList.remove('show');}));
-document.addEventListener('keydown',e=>{if(e.key==='Escape')document.querySelectorAll('.overlay.show').forEach(o=>o.classList.remove('show'));});
+document.querySelectorAll('.overlay').forEach(o=>o.addEventListener('click',e=>{if(e.target===o && o.id!=='authOverlay')o.classList.remove('show');}));
+document.addEventListener('keydown',e=>{if(e.key==='Escape')document.querySelectorAll('.overlay.show').forEach(o=>{if(o.id!=='authOverlay')o.classList.remove('show');});});
 ['txnAmount','invName'].forEach(id=>document.getElementById(id).addEventListener('keydown',e=>{if(e.key==='Enter'){id==='invName'?saveInvestor():saveTxn();}}));
+['authEmail','authPass'].forEach(id=>{const el=document.getElementById(id);if(el)el.addEventListener('keydown',e=>{if(e.key==='Enter')doAuth('signin');});});
 
 /* ---------- boot ---------- */
 load();render();
+if(CLOUD){cloudInit();}
+window.addEventListener('focus',cloudRefresh);
 </script>
 </body>
 </html>
